@@ -42,4 +42,8 @@
     </Reference>
   </ItemGroup>
 
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <Exec Command="copy &quot;$(TargetPath)&quot; &quot;C:\Program Files\Paint.NET\FileTypes\&quot;" />
+  </Target>
+
 </Project>

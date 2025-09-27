@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "IconCreator": {
+      "commandName": "Project"
+    },
+    "Debug": {
+      "commandName": "Executable",
+      "executablePath": "C:\\Program Files\\Paint.NET\\paintdotnet.exe",
+      "workingDirectory": "C:\\Program Files\\Paint.NET\\"
+    }
+  }
+}

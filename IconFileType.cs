@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Linq;
 using PaintDotNet;
 using PaintDotNet.IndirectUI;
 using PaintDotNet.PropertySystem;
@@ -10,6 +11,13 @@ using PaintDotNet.Rendering;
 
 namespace IconCreatorFileType
 {
+    public class FileFormatException : Exception
+    {
+        public FileFormatException() : base() { }
+        public FileFormatException(string message) : base(message) { }
+        public FileFormatException(string message, Exception inner) : base(message, inner) { }
+    }
+
     public enum ImageSize
     {
         Icon_Auto,
@@ -64,25 +72,208 @@ namespace IconCreatorFileType
 
         protected override Document OnLoad(Stream input)
         {
-            using Icon icon = new(input);
-            Bitmap bitmap = icon.ToBitmap();
-            Document document = null;
-            if (bitmap.Width > 0 && bitmap.Height > 0)
+            if (input == null)
+                throw new ArgumentNullException(nameof(input));
+            if (!input.CanSeek)
             {
-                document = new Document(bitmap.Width, bitmap.Height);
-                BitmapLayer layer = Layer.CreateBackgroundLayer(bitmap.Width, bitmap.Height);
-                Surface surface = layer.Surface;
-                for (int y = 0; y < surface.Height; y++)
+                var ms = new MemoryStream();
+                input.CopyTo(ms);
+                ms.Position = 0;
+                input = ms;
+            }
+
+            try
+            {
+                var entries = ParseIcoEntries(input);
+                if (entries == null || entries.Count == 0)
+                    throw new FileFormatException("No icon entries found in ICO stream.");
+
+                var extracted = new List<ExtractedIcon>();
+                foreach (var e in entries)
                 {
-                    for (int x = 0; x < surface.Width; x++)
+                    try
                     {
-                        surface[x, y] = bitmap.GetPixel(x, y);
+                        var bmp = BuildBitmapForEntry(input, e);
+                        if (bmp != null)
+                        {
+                            extracted.Add(new ExtractedIcon
+                            {
+                                Width = e.Width,
+                                Height = e.Height,
+                                BitCount = e.BitCount,
+                                Bitmap = bmp
+                            });
+                        }
+                    }
+                    catch
+                    {
+                        // ignore individual malformed entries
                     }
                 }
-                document.Layers.Add(layer);
+
+                if (extracted.Count == 0)
+                    throw new FileFormatException("Could not decode any icon images from ICO.");
+
+                // Select largest icon (area), tie-breaker by bit depth
+                var best = extracted
+                    .OrderByDescending(x => (long)x.Width * x.Height)
+                    .ThenByDescending(x => x.BitCount)
+                    .First();
+
+                // Convert Bitmap to Paint.NET Document
+                Document doc = null;
+                Bitmap bitmap = best.Bitmap;
+                if (bitmap.Width > 0 && bitmap.Height > 0)
+                {
+                    doc = new Document(bitmap.Width, bitmap.Height);
+                    BitmapLayer layer = Layer.CreateBackgroundLayer(bitmap.Width, bitmap.Height);
+                    Surface surface = layer.Surface;
+
+                    for (int y = 0; y < surface.Height; y++)
+                    {
+                        for (int x = 0; x < surface.Width; x++)
+                        {
+                            System.Drawing.Color c = bitmap.GetPixel(x, y);
+                            surface[x, y] = ColorBgra.FromBgra(c.B, c.G, c.R, c.A);
+                        }
+                    }
+
+                    doc.Layers.Add(layer);
+                }
+
+                // Dispose other bitmaps
+                foreach (var ex in extracted)
+                {
+                    if (!ReferenceEquals(ex.Bitmap, bitmap))
+                        ex.Bitmap.Dispose();
+                }
+
+                return doc;
             }
-            return document;
+            catch (Exception ex)
+            {
+                throw new FileFormatException("Failed to load ICO: " + ex.Message, ex);
+            }
         }
+
+        #region ICO helpers
+
+        private class IcoDirEntry
+        {
+            public int Width;
+            public int Height;
+            public int ColorCount;
+            public int Reserved;
+            public ushort Planes;
+            public ushort BitCount;
+            public uint BytesInRes;
+            public uint ImageOffset;
+        }
+
+        private class ExtractedIcon
+        {
+            public int Width;
+            public int Height;
+            public int BitCount;
+            public Bitmap Bitmap;
+        }
+
+        private List<IcoDirEntry> ParseIcoEntries(Stream s)
+        {
+            long origPos = s.Position;
+            try
+            {
+                using (var br = new BinaryReader(s, System.Text.Encoding.UTF8, leaveOpen: true))
+                {
+                    s.Position = 0;
+                    ushort reserved = br.ReadUInt16();
+                    ushort type = br.ReadUInt16();
+                    ushort count = br.ReadUInt16();
+
+                    var entries = new List<IcoDirEntry>();
+                    for (int i = 0; i < count; i++)
+                    {
+                        byte w = br.ReadByte();
+                        byte h = br.ReadByte();
+                        byte colorCount = br.ReadByte();
+                        byte reservedByte = br.ReadByte();
+                        ushort planes = br.ReadUInt16();
+                        ushort bitCount = br.ReadUInt16();
+                        uint bytesInRes = br.ReadUInt32();
+                        uint imageOffset = br.ReadUInt32();
+
+                        int width = (w == 0) ? 256 : w;
+                        int height = (h == 0) ? 256 : h;
+
+                        if (imageOffset == 0 || bytesInRes == 0)
+                            continue;
+
+                        entries.Add(new IcoDirEntry
+                        {
+                            Width = width,
+                            Height = height,
+                            ColorCount = colorCount,
+                            Reserved = reservedByte,
+                            Planes = planes,
+                            BitCount = bitCount,
+                            BytesInRes = bytesInRes,
+                            ImageOffset = imageOffset
+                        });
+                    }
+
+                    return entries;
+                }
+            }
+            finally
+            {
+                s.Position = origPos;
+            }
+        }
+
+        private Bitmap BuildBitmapForEntry(Stream fullIcoStream, IcoDirEntry entry)
+        {
+            byte[] imageBytes = new byte[entry.BytesInRes];
+            fullIcoStream.Position = entry.ImageOffset;
+            int read = 0;
+            while (read < imageBytes.Length)
+            {
+                int r = fullIcoStream.Read(imageBytes, read, imageBytes.Length - read);
+                if (r == 0) break;
+                read += r;
+            }
+            if (read != imageBytes.Length)
+                throw new EndOfStreamException("Unexpected end of ICO when reading image data");
+
+            using (var ms = new MemoryStream())
+            using (var bw = new BinaryWriter(ms))
+            {
+                bw.Write((ushort)0); // reserved
+                bw.Write((ushort)1); // type
+                bw.Write((ushort)1); // count
+
+                byte w = (byte)(entry.Width == 256 ? 0 : entry.Width);
+                byte h = (byte)(entry.Height == 256 ? 0 : entry.Height);
+                bw.Write(w);
+                bw.Write(h);
+                bw.Write((byte)entry.ColorCount);
+                bw.Write((byte)entry.Reserved);
+                bw.Write((ushort)entry.Planes);
+                bw.Write((ushort)entry.BitCount);
+                bw.Write((uint)imageBytes.Length);
+                bw.Write((uint)(6 + 16)); // offset to image data
+                bw.Write(imageBytes);
+
+                bw.Flush();
+                ms.Position = 0;
+
+                using (var icon = new Icon(ms))
+                {
+                    return icon.ToBitmap();
+                }
+            }
+        }
+
+        #endregion
 
         protected override void OnSaveT(Document input, Stream output, PropertyBasedSaveConfigToken token, Surface scratchSurface, ProgressEventHandler progressCallback)
         {
